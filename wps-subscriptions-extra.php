@@ -181,11 +181,22 @@ if ( ! function_exists( 'wps_src_walk_subscriptions' ) ) {
  * bakes those into the stored recurring price; re-applying them would double the
  * discount.
  *
- * @param int $order_id Order ID to read coupons from.
- * @return array List of { code, type, amount }; empty when none apply.
+ * The `discount` key records the actual dollar amount the order's line items were
+ * reduced by, apportioned across coupons by each WC_Order_Item_Coupon's own
+ * recorded discount. This is what the customer actually paid less, independent of
+ * the coupon's type or amount, so later renewals reproduce the real discount even
+ * if the coupon's rules change. When a subscription ID is given, only the parent
+ * order's line item(s) matching that subscription's product are counted, so a
+ * mixed cart (subscription plus one-off products) does not inflate the recorded
+ * discount with savings the renewal's single line never received.
+ *
+ * @param int $order_id        Order ID to read coupons from.
+ * @param int $subscription_id Optional subscription ID; restricts the line-discount
+ *                             sum to that subscription's product line(s).
+ * @return array List of { code, type, amount, discount }; empty when none apply.
  */
 if ( ! function_exists( 'wps_src_build_snapshot' ) ) {
-	function wps_src_build_snapshot( $order_id ) {
+	function wps_src_build_snapshot( $order_id, $subscription_id = 0 ) {
 		if ( ! class_exists( 'WC_Coupon' ) ) {
 			return array();
 		}
@@ -200,20 +211,79 @@ if ( ! function_exists( 'wps_src_build_snapshot' ) ) {
 			return array();
 		}
 
-		$snapshot = array();
+		$decimals = function_exists( 'wc_get_price_decimals' ) ? wc_get_price_decimals() : 2;
+
+		// The base plugin stores the subscription's product ID (the variation ID
+		// for variable products) on the subscription itself.
+		$sub_product_id = $subscription_id ? (int) wps_src_get_subscription_meta( $subscription_id, 'product_id' ) : 0;
+
+		// Line discount: what the customer actually saved, pre- vs. post-coupon,
+		// on the subscription's own line(s) when the product is known, falling
+		// back to all lines when no line matches (product changed or deleted, or
+		// meta absent).
+		$line_discount_total = 0.0;
+		$matched_total       = 0.0;
+		$matched_any         = false;
+		foreach ( $order->get_items( 'line_item' ) as $item ) {
+			$line_discount = ( (float) $item->get_subtotal() - (float) $item->get_total() );
+			$line_discount_total += $line_discount;
+
+			if ( $sub_product_id ) {
+				$item_product_id = (int) $item->get_variation_id();
+				if ( ! $item_product_id ) {
+					$item_product_id = (int) $item->get_product_id();
+				}
+				if ( $item_product_id === $sub_product_id ) {
+					$matched_total += $line_discount;
+					$matched_any    = true;
+				}
+			}
+		}
+		if ( $matched_any ) {
+			$line_discount_total = $matched_total;
+		}
+
+		// Coupon items carry WooCommerce's own per-coupon discount split, used to
+		// apportion the order-level line discount across multiple coupons.
+		$coupon_items        = $order->get_items( 'coupon' );
+		$coupon_discounts    = array();
+		$coupon_discount_sum = 0.0;
+		foreach ( $coupon_items as $coupon_item ) {
+			$code                      = $coupon_item->get_code();
+			$amt                       = (float) $coupon_item->get_discount();
+			$coupon_discounts[ $code ] = $amt;
+			$coupon_discount_sum      += $amt;
+		}
+
+		// Only codes eligible for the snapshot (native recurring types excluded)
+		// count toward the "single coupon" shortcut below.
+		$eligible = array();
 		foreach ( $codes as $code ) {
+			$coupon = new WC_Coupon( $code );
+			if ( ! wps_src_is_native_recurring_type( $coupon->get_discount_type() ) ) {
+				$eligible[] = $code;
+			}
+		}
+
+		$snapshot = array();
+		foreach ( $eligible as $code ) {
 			$coupon = new WC_Coupon( $code );
 			$type   = $coupon->get_discount_type();
 
-			// Already persisted by the base plugin; do not re-apply.
-			if ( wps_src_is_native_recurring_type( $type ) ) {
-				continue;
+			if ( $coupon_discount_sum <= 0 ) {
+				$discount = 0.0;
+			} elseif ( 1 === count( $eligible ) ) {
+				$discount = $line_discount_total;
+			} else {
+				$share    = isset( $coupon_discounts[ $code ] ) ? $coupon_discounts[ $code ] : 0.0;
+				$discount = $line_discount_total * ( $share / $coupon_discount_sum );
 			}
 
 			$snapshot[] = array(
-				'code'   => $code,
-				'type'   => $type,
-				'amount' => (float) $coupon->get_amount(),
+				'code'     => $code,
+				'type'     => $type,
+				'amount'   => (float) $coupon->get_amount(),
+				'discount' => round( $discount, $decimals ),
 			);
 		}
 
@@ -229,7 +299,7 @@ if ( ! function_exists( 'wps_src_build_snapshot' ) ) {
  */
 if ( ! function_exists( 'wps_src_snapshot_coupons' ) ) {
 	function wps_src_snapshot_coupons( $subscription_id, $order_id ) {
-		$snapshot = wps_src_build_snapshot( $order_id );
+		$snapshot = wps_src_build_snapshot( $order_id, $subscription_id );
 		if ( ! empty( $snapshot ) ) {
 			wps_src_update_subscription_meta( $subscription_id, WPS_SRC_SNAPSHOT_META, $snapshot );
 		}
@@ -276,6 +346,102 @@ if ( ! function_exists( 'wps_src_coupon_line_discount' ) ) {
 		}
 
 		return $discount;
+	}
+}
+
+/**
+ * Compute price-lock discounts from a snapshot against a set of line totals.
+ *
+ * Shared by wps_src_apply_recurring_coupons() (lock mode) and
+ * wps_src_preview_amounts() so both stay in agreement. When a snapshot entry
+ * carries a `discount` key it is spent as a flat amount across lines, the same
+ * way the old flat (fixed_cart) budget was spent, with no coupon-type sniffing;
+ * this is the actual dollar discount the customer received at signup. Entries
+ * without a `discount` key (snapshots recorded before this key existed) fall
+ * back to wps_src_coupon_line_discount()'s type-based math. An entry whose
+ * effective amount is zero or less is skipped entirely: a recorded `discount`
+ * of 0 means the customer received no discount on this line, so nothing should
+ * be applied now either.
+ *
+ * @param array $snapshot List of { code, type, amount, discount? }.
+ * @param array $lines    List of { total: float, qty: int }, one per order line.
+ * @return array {
+ *     'coupons' => array<string, float> Per-coupon-code total discount applied.
+ *     'lines'   => float[] Per-line reduction, indexed the same as $lines.
+ * }
+ */
+if ( ! function_exists( 'wps_src_compute_lock_discounts' ) ) {
+	function wps_src_compute_lock_discounts( $snapshot, $lines ) {
+		$coupons = array();
+		$running = array();
+		foreach ( $lines as $i => $line ) {
+			$running[ $i ] = (float) $line['total'];
+		}
+		$reductions = array_fill_keys( array_keys( $running ), 0.0 );
+
+		foreach ( $snapshot as $cpn ) {
+			$code = isset( $cpn['code'] ) ? $cpn['code'] : '';
+			if ( '' === $code ) {
+				continue;
+			}
+
+			$has_discount = array_key_exists( 'discount', $cpn );
+			$type         = isset( $cpn['type'] ) ? $cpn['type'] : '';
+			$amount       = isset( $cpn['amount'] ) ? (float) $cpn['amount'] : 0;
+
+			if ( $has_discount ) {
+				$flat_remaining = (float) $cpn['discount'];
+			} else {
+				$is_percent     = ( false !== strpos( $type, 'percent' ) );
+				$is_product     = ( ! $is_percent && false !== strpos( $type, 'product' ) );
+				$flat_remaining = ( ! $is_percent && ! $is_product ) ? $amount : null;
+			}
+
+			if ( $has_discount && $flat_remaining <= 0 ) {
+				continue;
+			}
+			if ( ! $has_discount && $amount <= 0 ) {
+				continue;
+			}
+
+			$coupon_discount = 0.0;
+
+			foreach ( $running as $i => $base ) {
+				if ( $base <= 0 ) {
+					continue;
+				}
+
+				if ( $has_discount ) {
+					// Flat amount, spent across lines like the old fixed_cart
+					// budget, capped per line, no type sniffing.
+					$discount = min( $flat_remaining, $base );
+					$flat_remaining = max( 0, $flat_remaining - $discount );
+				} else {
+					$discount = wps_src_coupon_line_discount( $type, $amount, $base, $lines[ $i ]['qty'], $flat_remaining );
+				}
+
+				if ( $discount <= 0 ) {
+					continue;
+				}
+
+				$running[ $i ]     -= $discount;
+				$reductions[ $i ]  += $discount;
+				$coupon_discount   += $discount;
+
+				if ( null !== $flat_remaining && $flat_remaining <= 0 ) {
+					break;
+				}
+			}
+
+			if ( $coupon_discount > 0 ) {
+				$coupons[ $code ] = ( isset( $coupons[ $code ] ) ? $coupons[ $code ] : 0.0 ) + $coupon_discount;
+			}
+		}
+
+		return array(
+			'coupons' => $coupons,
+			'lines'   => $reductions,
+		);
 	}
 }
 
@@ -333,6 +499,19 @@ if ( ! function_exists( 'wps_src_apply_recurring_coupons' ) ) {
 			return;
 		}
 
+		// PayPal Standard captures the full billing-agreement amount via IPN
+		// before this renewal order even exists, so discounting the order here
+		// would not change what the customer was actually charged. Checked after
+		// the snapshot load so the note only appears on renewals that would
+		// otherwise have been discounted. The applied guard is intentionally
+		// left unset since no discount was applied.
+		if ( 'paypal' === $order->get_payment_method() ) {
+			$order->add_order_note(
+				__( 'Coupon discount not applied: this renewal was paid via PayPal Standard, which charges the full billing-agreement amount before the renewal order is created, so discounting the order would not match what the customer was charged.', 'wps-subscriptions-extra' )
+			);
+			return;
+		}
+
 		$mode        = wps_src_get_discount_mode( $subscription_id );
 		$applied_any = false;
 
@@ -345,58 +524,53 @@ if ( ! function_exists( 'wps_src_apply_recurring_coupons' ) ) {
 				if ( '' === $code ) {
 					continue;
 				}
-				if ( ! is_wp_error( $order->apply_coupon( $code ) ) ) {
+				$result = $order->apply_coupon( $code );
+				if ( is_wp_error( $result ) ) {
+					$order->add_order_note(
+						sprintf(
+							/* translators: 1: coupon code, 2: error message from WooCommerce */
+							__( 'Coupon "%1$s" could not be applied to this renewal: %2$s', 'wps-subscriptions-extra' ),
+							$code,
+							$result->get_error_message()
+						)
+					);
+				} else {
 					$applied_any = true;
 				}
 			}
 		} else {
 			// Price-lock: recompute the discount from the snapshot, independent
-			// of the coupon's current state.
-			foreach ( $snapshot as $cpn ) {
-				$code   = isset( $cpn['code'] ) ? $cpn['code'] : '';
-				$type   = isset( $cpn['type'] ) ? $cpn['type'] : '';
-				$amount = isset( $cpn['amount'] ) ? (float) $cpn['amount'] : 0;
+			// of the coupon's current state, via the helper shared with the
+			// admin preview so the two cannot drift.
+			$lines = array();
+			foreach ( $items as $item ) {
+				$lines[] = array(
+					'total' => (float) $item->get_total(),
+					'qty'   => $item->get_quantity(),
+				);
+			}
 
-				if ( '' === $code || $amount <= 0 ) {
+			$computed   = wps_src_compute_lock_discounts( $snapshot, $lines );
+			$item_index = array_values( $items );
+
+			foreach ( $computed['lines'] as $i => $reduction ) {
+				if ( $reduction <= 0 ) {
 					continue;
 				}
+				$item = $item_index[ $i ];
+				$item->set_total( (float) $item->get_total() - $reduction );
+			}
 
-				$is_percent = ( false !== strpos( $type, 'percent' ) );
-				$is_product = ( ! $is_percent && false !== strpos( $type, 'product' ) );
-
-				// null marks per-line (percent/product); a number is the shared
-				// flat budget spent across lines (fixed_cart applied once).
-				$flat_remaining  = ( ! $is_percent && ! $is_product ) ? $amount : null;
-				$coupon_discount = 0.0;
-
-				foreach ( $items as $item ) {
-					$base = (float) $item->get_total(); // running total; lets coupons stack
-					if ( $base <= 0 ) {
-						continue;
-					}
-
-					$discount = wps_src_coupon_line_discount( $type, $amount, $base, $item->get_quantity(), $flat_remaining );
-					if ( $discount <= 0 ) {
-						continue;
-					}
-
-					$item->set_total( $base - $discount );
-					$item->save();
-					$coupon_discount += $discount;
-
-					if ( null !== $flat_remaining && $flat_remaining <= 0 ) {
-						break;
-					}
+			foreach ( $computed['coupons'] as $code => $coupon_discount ) {
+				if ( $coupon_discount <= 0 ) {
+					continue;
 				}
-
-				if ( $coupon_discount > 0 ) {
-					$coupon_item = new WC_Order_Item_Coupon();
-					$coupon_item->set_code( $code );
-					$coupon_item->set_discount( $coupon_discount );
-					$coupon_item->set_discount_tax( 0 );
-					$order->add_item( $coupon_item );
-					$applied_any = true;
-				}
+				$coupon_item = new WC_Order_Item_Coupon();
+				$coupon_item->set_code( $code );
+				$coupon_item->set_discount( $coupon_discount );
+				$coupon_item->set_discount_tax( 0 );
+				$order->add_item( $coupon_item );
+				$applied_any = true;
 			}
 		}
 
@@ -404,12 +578,21 @@ if ( ! function_exists( 'wps_src_apply_recurring_coupons' ) ) {
 			return;
 		}
 
+		// The guard must be set on the order object before calculate_totals():
+		// its calculate_taxes() step triggers an internal $order->save(), and that
+		// save must persist the guard together with the discounted items, or a
+		// crash between the two saves would leave a discounted-but-unguarded
+		// order that could be discounted again.
 		$order->update_meta_data( WPS_SRC_APPLIED_META, 'yes' );
+
 		// Live mode already recalculated via apply_coupon(); only lock mode needs
 		// the manually discounted lines re-summed with taxes.
 		if ( 'live' !== $mode ) {
 			$order->calculate_totals( true );
 		}
+
+		// Final save covers the live-mode path and is a safe no-op when
+		// calculate_totals() already persisted everything.
 		$order->save();
 
 		$order->add_order_note(
@@ -460,7 +643,7 @@ if ( ! function_exists( 'wps_src_run_backfill' ) ) {
 					return;
 				}
 
-				$snapshot = wps_src_build_snapshot( $parent_order_id );
+				$snapshot = wps_src_build_snapshot( $parent_order_id, $subscription_id );
 				if ( empty( $snapshot ) ) {
 					$result['skipped']++;
 					return;
@@ -559,7 +742,7 @@ if ( ! function_exists( 'wps_src_collect_stats' ) ) {
 				}
 
 				$parent   = wps_src_get_subscription_meta( $id, WPS_SRC_PARENT_META );
-				$eligible = ( ! empty( $parent ) && 'manual' !== $parent && ! empty( wps_src_build_snapshot( $parent ) ) );
+				$eligible = ( ! empty( $parent ) && 'manual' !== $parent && ! empty( wps_src_build_snapshot( $parent, $id ) ) );
 				$active   = ( 'active' === wps_src_get_subscription_meta( $id, WPS_SRC_STATUS_META ) );
 				if ( $eligible && $active ) {
 					$stats['eligible_missing']++;
@@ -683,6 +866,10 @@ if ( ! function_exists( 'wps_src_fix_pending_renewals' ) ) {
  * Compute a subscription's next-renewal price before and after the snapshot
  * discount, without creating an order. Single-line estimate.
  *
+ * The discount math goes through wps_src_compute_lock_discounts(), the same
+ * helper the actual renewal application uses, so preview and application
+ * cannot drift.
+ *
  * @param int $subscription_id Subscription ID.
  * @return array { full:float, discounted:float, has_snapshot:bool }
  */
@@ -697,14 +884,8 @@ if ( ! function_exists( 'wps_src_preview_amounts' ) ) {
 
 		$running = $base;
 		if ( is_array( $snapshot ) ) {
-			foreach ( $snapshot as $cpn ) {
-				$type   = isset( $cpn['type'] ) ? $cpn['type'] : '';
-				$amount = isset( $cpn['amount'] ) ? (float) $cpn['amount'] : 0;
-				$is_p   = ( false !== strpos( $type, 'percent' ) );
-				$is_pr  = ( ! $is_p && false !== strpos( $type, 'product' ) );
-				$flat   = ( ! $is_p && ! $is_pr ) ? $amount : null;
-				$running -= wps_src_coupon_line_discount( $type, $amount, $running, $qty, $flat );
-			}
+			$computed = wps_src_compute_lock_discounts( $snapshot, array( array( 'total' => $base, 'qty' => $qty ) ) );
+			$running  = $base - $computed['lines'][0];
 		}
 
 		$next_date = (int) wps_src_get_subscription_meta( $subscription_id, 'wps_next_payment_date' );
@@ -717,6 +898,117 @@ if ( ! function_exists( 'wps_src_preview_amounts' ) ) {
 		);
 	}
 }
+
+/**
+ * Price info for the My Account display: the subscription's full recurring
+ * total and the total after the locked discount.
+ *
+ * Returns null (show nothing, base plugin renders the full price as usual)
+ * unless all of these hold: a snapshot exists, the effective discount mode is
+ * price-lock (in live mode the renewal amount depends on coupon validation at
+ * charge time, so no number can be promised), the payment method is not PayPal
+ * Standard (PayPal captures the full billing-agreement amount regardless), the
+ * subscription is not cancelled, and the discount is actually positive.
+ *
+ * The discount is computed from the line-total preview and subtracted from the
+ * subscription's stored total, so tax/shipping components of the total are
+ * preserved; the discount itself is treated as tax-free here, matching how the
+ * renewal order applies it before recalculating totals.
+ *
+ * Cached per request: the templates fire the filter and the action for the
+ * same subscription back to back, and the list table repeats per row.
+ *
+ * @param int $subscription_id Subscription ID.
+ * @return array|null { full:float, discounted:float } or null to show nothing.
+ */
+if ( ! function_exists( 'wps_src_account_price_info' ) ) {
+	function wps_src_account_price_info( $subscription_id ) {
+		static $cache = array();
+		$subscription_id = (int) $subscription_id;
+		if ( array_key_exists( $subscription_id, $cache ) ) {
+			return $cache[ $subscription_id ];
+		}
+		$cache[ $subscription_id ] = null;
+
+		if ( 'lock' !== wps_src_get_discount_mode( $subscription_id ) ) {
+			return null;
+		}
+		if ( 'cancelled' === wps_src_get_subscription_meta( $subscription_id, WPS_SRC_STATUS_META ) ) {
+			return null;
+		}
+
+		$subscription = wc_get_order( $subscription_id );
+		if ( ! $subscription || 'paypal' === $subscription->get_payment_method() ) {
+			return null;
+		}
+
+		$preview = wps_src_preview_amounts( $subscription_id );
+		if ( ! $preview['has_snapshot'] ) {
+			return null;
+		}
+		$discount = $preview['full'] - $preview['discounted'];
+		if ( $discount <= 0 ) {
+			return null;
+		}
+
+		$full = (float) $subscription->get_total();
+		if ( $full <= 0 ) {
+			$full = (float) wps_src_get_subscription_meta( $subscription_id, 'wps_recurring_total' );
+		}
+		if ( $full <= 0 ) {
+			return null;
+		}
+
+		$cache[ $subscription_id ] = array(
+			'full'       => $full,
+			'discounted' => max( 0, $full - $discount ),
+		);
+		return $cache[ $subscription_id ];
+	}
+}
+
+/**
+ * My Account: swap the displayed recurring total for the locked renewal price.
+ *
+ * Runs on the base plugin's wps_sfw_sub_recurring_total_my_account_page filter,
+ * which feeds both the subscriptions list table and the single-subscription
+ * details view (classic and aurora templates).
+ *
+ * @param mixed $price           Recurring total about to be displayed.
+ * @param int   $subscription_id Subscription ID.
+ * @return mixed
+ */
+if ( ! function_exists( 'wps_src_filter_account_recurring_total' ) ) {
+	function wps_src_filter_account_recurring_total( $price, $subscription_id ) {
+		$info = wps_src_account_price_info( $subscription_id );
+		return ( null !== $info ) ? $info['discounted'] : $price;
+	}
+}
+add_filter( 'wps_sfw_sub_recurring_total_my_account_page', 'wps_src_filter_account_recurring_total', 10, 2 );
+
+/**
+ * My Account: append the struck-through original price after the discounted
+ * total, so customers see the discount they are keeping. Priority 20 runs
+ * after the base plugin's price output on the same action.
+ *
+ * @param int $subscription_id Subscription ID.
+ */
+if ( ! function_exists( 'wps_src_render_account_original_price' ) ) {
+	function wps_src_render_account_original_price( $subscription_id ) {
+		$info = wps_src_account_price_info( $subscription_id );
+		if ( null === $info ) {
+			return;
+		}
+		echo ' <del class="wps-src-original-price" aria-label="' . esc_attr(
+			sprintf(
+				/* translators: %s: original (pre-discount) price */
+				__( 'Original price %s', 'wps-subscriptions-extra' ),
+				wp_strip_all_tags( wc_price( $info['full'] ) )
+			)
+		) . '">' . wp_kses_post( wc_price( $info['full'] ) ) . '</del>';
+	}
+}
+add_action( 'wps_sfw_display_susbcription_recerring_total_account_page', 'wps_src_render_account_original_price', 20 );
 
 /**
  * Delete a meta key from a subscription, HPOS-aware.
@@ -893,7 +1185,11 @@ if ( ! function_exists( 'wps_src_render_subscriptions_table' ) ) {
 			if ( ! empty( $snap ) && is_array( $snap ) ) {
 				$parts = array();
 				foreach ( $snap as $c ) {
-					$parts[] = $c['code'] . ' (' . $c['type'] . ' ' . $c['amount'] . ')';
+					$part = $c['code'] . ' (' . $c['type'] . ' ' . $c['amount'];
+					if ( isset( $c['discount'] ) ) {
+						$part .= ' ' . "\u{2192}" . ' ' . $c['discount'];
+					}
+					$parts[] = $part . ')';
 				}
 				$summary = implode( ', ', $parts );
 			}
@@ -1005,7 +1301,7 @@ if ( ! function_exists( 'wps_src_render_admin_page' ) ) {
 			if ( $sub_id ) {
 				if ( 'resnapshot' === $action ) {
 					$parent = wps_src_get_subscription_meta( $sub_id, WPS_SRC_PARENT_META );
-					$snap   = ( $parent && 'manual' !== $parent ) ? wps_src_build_snapshot( $parent ) : array();
+					$snap   = ( $parent && 'manual' !== $parent ) ? wps_src_build_snapshot( $parent, $sub_id ) : array();
 					if ( ! empty( $snap ) ) {
 						wps_src_update_subscription_meta( $sub_id, WPS_SRC_SNAPSHOT_META, $snap );
 						wps_src_bust_stats();
