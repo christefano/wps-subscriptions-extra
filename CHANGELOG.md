@@ -1,5 +1,11 @@
 # Changelog
 
+## 2.0.1 - Double-charge protection.
+
+- Duplicate renewals: before a charge, WPS Subscriptions Extra claims only one renewal per subscription per billing cycle.
+- Action Scheduler compatibility: check for duplicate Action Scheduler actions and keep the earliest one.
+- Uninstall also removes the per-period claim.
+
 ## 2.0 - First public release.
 
 - Snapshots record the actual discount the customer received on the subscription's own product line (variation-aware, falling back to all lines when no line matches), and renewals apply that recorded amount flat with no coupon-type sniffing. Old-format snapshots without the recorded discount fall back to the previous type-based math.

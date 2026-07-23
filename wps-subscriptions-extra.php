@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Subscriptions for WooCommerce Extra
  * Description: Extra tools and views for Subscriptions for WooCommerce (WP Swings), including support for coupon-based discounts on recurring renewals.
- * Version: 2.0
+ * Version: 2.0.1
  * Author: Christefano Reyes
  * Plugin URI: https://github.com/christefano/wps-subscriptions-extra
  * Text Domain: wps-subscriptions-extra
@@ -26,10 +26,12 @@
  * and uses its HPOS-aware meta helpers (wps_sfw_get_meta_data /
  * wps_sfw_update_meta_data).
  *
- * Version policy: this plugin's version mirrors the Subscriptions for WooCommerce
- * release it is built and verified against. It is known to work ONLY with
- * Subscriptions for WooCommerce 2.0, so this version is pinned at 2.0 and must not
- * be advanced beyond it. Tested with WooCommerce 10.9 and HPOS enabled.
+ * Version policy: this plugin's major.minor mirrors the Subscriptions for
+ * WooCommerce release it is built and verified against. It is known to work ONLY
+ * with Subscriptions for WooCommerce 2.0, so the major.minor is pinned at 2.0 and
+ * must not be advanced beyond it; the patch component (2.0.x) is used for add-on-side
+ * fixes that do not change base-plugin compatibility. Tested with WooCommerce 10.9
+ * and HPOS enabled.
  */
 
 if ( ! defined( 'ABSPATH' ) ) {
@@ -45,6 +47,13 @@ define( 'WPS_SRC_SNAPSHOT_META', '_wps_src_recurring_coupons' );
  * Order meta flag marking a renewal as already processed (re-entrancy guard).
  */
 define( 'WPS_SRC_APPLIED_META', '_wps_src_applied' );
+
+/**
+ * Order meta flag marking a renewal order as a suppressed duplicate: its line
+ * totals were zeroed so the base plugin's gateway charge (which skips orders
+ * whose total is <= 0) does not charge the customer a second time.
+ */
+define( 'WPS_SRC_DUP_META', '_wps_src_dup_suppressed' );
 
 /**
  * Subscription order type registered by Subscriptions for WooCommerce.
@@ -463,6 +472,174 @@ if ( ! function_exists( 'wps_src_get_discount_mode' ) ) {
 }
 
 /**
+ * The subscription's billing interval in seconds, from its stored period unit and
+ * count. Used to size the duplicate-renewal cooldown. Unknown units fall back to a
+ * month.
+ *
+ * @param int $subscription_id Subscription ID.
+ * @return int Interval length in seconds (never below one day).
+ */
+if ( ! function_exists( 'wps_src_renewal_interval_seconds' ) ) {
+	function wps_src_renewal_interval_seconds( $subscription_id ) {
+		$number = (int) wps_src_get_subscription_meta( $subscription_id, 'wps_sfw_subscription_number' );
+		if ( $number < 1 ) {
+			$number = 1;
+		}
+		$period = (string) wps_src_get_subscription_meta( $subscription_id, 'wps_sfw_subscription_interval' );
+		$units  = array(
+			'day'   => DAY_IN_SECONDS,
+			'week'  => WEEK_IN_SECONDS,
+			'month' => 30 * DAY_IN_SECONDS,
+			'year'  => 365 * DAY_IN_SECONDS,
+		);
+		$unit = isset( $units[ $period ] ) ? $units[ $period ] : 30 * DAY_IN_SECONDS;
+		return max( DAY_IN_SECONDS, $number * $unit );
+	}
+}
+
+/**
+ * Prevent a subscription from being charged twice for the same billing period.
+ *
+ * The base plugin (Subscriptions for WooCommerce) re-registers its renewal
+ * Action Scheduler job on every `init`, guarded only by as_next_scheduled_action(),
+ * which returns false while the recurring job is mid-run. Under that race the
+ * store ends up with two live recurring schedules, so two renewal workers run per
+ * tick. The base renewal loop selects due subscriptions, advances the next-payment
+ * date and charges Stripe non-atomically, with no subscription-level lock and its
+ * own Stripe idempotency guard (lock_order_payment) commented out. When the two
+ * workers overlap, the same due subscription is charged twice; the renewal-tracking
+ * meta is lost-updated, so the duplicate order is orphaned and the store's records
+ * look clean while the customer paid twice.
+ *
+ * This guard closes that hole from the add-on side. It runs before the discount
+ * application (priority 5 vs 20) on the same hook the base fires after building the
+ * renewal order but before charging it. It claims one renewal per subscription per
+ * billing cycle atomically, then zeroes and cancels any second order for the same
+ * cycle so the base gateway charge (which returns early when the order total is
+ * <= 0) never charges the customer again.
+ *
+ * The claim is keyed on the subscription alone (not the due date), because the base
+ * plugin advances the next-payment date mid-run: two overlapping workers can read
+ * different dates for the same cycle, so a date-based key would miss the overlap.
+ * A per-subscription timestamp is claimed by an atomic INSERT (first ever) or an
+ * atomic conditional UPDATE that only flips the stored timestamp when it is older
+ * than the cooldown. InnoDB re-evaluates the UPDATE's WHERE under the row lock, so
+ * exactly one of any number of concurrent runs matches a row and proceeds; the rest
+ * are duplicates. The cooldown is half the billing interval: longer than any
+ * plausible skew between duplicate workers, shorter than the gap to the next
+ * legitimate renewal, so real next-cycle renewals always pass while every extra
+ * renewal inside the current cycle is caught.
+ *
+ * @param WC_Order|int $order           Renewal order (object or ID).
+ * @param int          $subscription_id Subscription ID.
+ */
+if ( ! function_exists( 'wps_src_guard_duplicate_renewal' ) ) {
+	function wps_src_guard_duplicate_renewal( $order, $subscription_id ) {
+		if ( ! ( $order instanceof WC_Order ) ) {
+			$order = wc_get_order( $order );
+		}
+		if ( ! $order ) {
+			return;
+		}
+
+		global $wpdb;
+		$now      = time();
+		$cooldown = max( 10 * MINUTE_IN_SECONDS, (int) ( wps_src_renewal_interval_seconds( $subscription_id ) / 2 ) );
+		$key      = 'wps_src_renclaim_' . (int) $subscription_id;
+
+		$proceed = false;
+		// First renewal ever for this subscription: atomic INSERT against the UNIQUE
+		// option_name column. autoload 'no' keeps the row out of the alloptions cache.
+		if ( add_option( $key, (string) $now, '', 'no' ) ) {
+			$proceed = true;
+		} else {
+			// Otherwise flip the timestamp only if the last claim is older than the
+			// cooldown. Exactly one concurrent run's UPDATE matches; the rest see 0
+			// affected rows and are duplicates.
+			$rows    = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND CAST( option_value AS UNSIGNED ) <= %d",
+					(string) $now,
+					$key,
+					$now - $cooldown
+				)
+			);
+			$proceed = ( $rows >= 1 );
+		}
+
+		if ( $proceed ) {
+			return;
+		}
+
+		// Duplicate renewal within the current cycle. Zero the lines so the base
+		// gateway charge skips it, and mark it so the discount application below
+		// leaves it alone.
+		foreach ( $order->get_items( 'line_item' ) as $item ) {
+			$item->set_subtotal( 0 );
+			$item->set_total( 0 );
+		}
+		$order->update_meta_data( WPS_SRC_DUP_META, 'yes' );
+		$order->calculate_totals( false );
+		$order->set_status( 'cancelled' );
+		$order->add_order_note(
+			sprintf(
+				/* translators: %d: subscription ID */
+				__( 'Duplicate renewal suppressed by Subscriptions for WooCommerce Extra: subscription #%d was already renewed for this billing period. This order was zeroed and cancelled to prevent a double charge.', 'wps-subscriptions-extra' ),
+				(int) $subscription_id
+			)
+		);
+		$order->save();
+	}
+}
+add_action( 'wps_sfw_renewal_order_creation', 'wps_src_guard_duplicate_renewal', 5, 2 );
+
+/**
+ * Collapse duplicate recurring renewal/expiry schedules down to one each.
+ *
+ * The base plugin re-registers these recurring Action Scheduler jobs on every
+ * `init`, guarded only by as_next_scheduled_action(), which returns false while
+ * the recurring job is mid-run; that race can leave two (or more) live recurring
+ * series, doubling how often the renewal loop runs and thereby the double-charge
+ * window. This keeps the earliest-scheduled pending occurrence of each hook and
+ * cancels the extras. A cancelled recurring occurrence never runs, so it never
+ * reschedules itself and the surplus series dies; the kept series keeps recurring.
+ *
+ * Runs on admin_init so it self-heals whenever an admin loads wp-admin, without a
+ * dedicated cron of its own.
+ */
+if ( ! function_exists( 'wps_src_dedupe_renewal_schedule' ) ) {
+	function wps_src_dedupe_renewal_schedule() {
+		if ( ! function_exists( 'as_get_scheduled_actions' ) || ! class_exists( 'ActionScheduler' ) ) {
+			return;
+		}
+
+		$hooks = array( 'wps_sfw_create_renewal_order_schedule', 'wps_sfw_expired_renewal_subscription' );
+		foreach ( $hooks as $hook ) {
+			$ids = as_get_scheduled_actions(
+				array(
+					'hook'     => $hook,
+					'status'   => 'pending',
+					'per_page' => 100,
+					'orderby'  => 'date',
+					'order'    => 'ASC',
+				),
+				'ids'
+			);
+
+			if ( ! is_array( $ids ) || count( $ids ) <= 1 ) {
+				continue;
+			}
+
+			array_shift( $ids ); // Keep the earliest-scheduled occurrence.
+			foreach ( $ids as $extra ) {
+				ActionScheduler::store()->cancel_action( (int) $extra );
+			}
+		}
+	}
+}
+add_action( 'admin_init', 'wps_src_dedupe_renewal_schedule' );
+
+/**
  * Apply the recorded coupon discount(s) to a renewal order.
  *
  * Fired after the base plugin has built, totalled, and saved the renewal order.
@@ -486,6 +663,12 @@ if ( ! function_exists( 'wps_src_apply_recurring_coupons' ) ) {
 
 		// Re-entrancy guard: never discount the same renewal twice.
 		if ( 'yes' === $order->get_meta( WPS_SRC_APPLIED_META ) ) {
+			return;
+		}
+
+		// Duplicate renewal already zeroed by the duplicate-charge guard: leave it
+		// at zero so the base gateway charge skips it.
+		if ( 'yes' === $order->get_meta( WPS_SRC_DUP_META ) ) {
 			return;
 		}
 
@@ -1522,6 +1705,10 @@ if ( ! function_exists( 'wps_src_uninstall' ) ) {
 		delete_option( WPS_SRC_MODE_OPTION );
 		delete_option( WPS_SRC_LASTRUN_OPTION );
 		delete_transient( WPS_SRC_STATS_TRANSIENT );
+
+		// Per-period duplicate-renewal claim rows written by the guard.
+		global $wpdb;
+		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE 'wps_src_renclaim\\_%'" );
 
 		// Legacy CPT-stored subscriptions.
 		delete_post_meta_by_key( WPS_SRC_SNAPSHOT_META );
