@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Subscriptions for WooCommerce Extra
  * Description: Extra tools and views for Subscriptions for WooCommerce (WP Swings), including support for coupon-based discounts on recurring renewals.
- * Version: 2.0.1
+ * Version: 2.0.2
  * Author: Christefano Reyes
  * Plugin URI: https://github.com/christefano/wps-subscriptions-extra
  * Text Domain: wps-subscriptions-extra
@@ -76,6 +76,15 @@ define( 'WPS_SRC_MODE_META', '_wps_src_discount_mode' );
  */
 define( 'WPS_SRC_MODE_OPTION', 'wps_src_discount_mode' );
 define( 'WPS_SRC_LASTRUN_OPTION', 'wps_src_last_run' );
+
+/**
+ * Option holding the "hide the duplicate WP Swings top-level menu" checkbox
+ * state ('yes' or unset/anything else). The base plugin (Subscriptions for
+ * WooCommerce) registers its own settings under WooCommerce -> Wps
+ * Subscriptions already, so its separate top-level "WP Swings" menu
+ * (add_menu_page slug 'wps-plugins') duplicates that entry point.
+ */
+define( 'WPS_SRC_HIDE_WPSWINGS_MENU_OPTION', 'wps_src_hide_wpswings_menu' );
 
 /**
  * Base-plugin (Subscriptions for WooCommerce) meta keys this plugin reads.
@@ -640,6 +649,222 @@ if ( ! function_exists( 'wps_src_dedupe_renewal_schedule' ) ) {
 add_action( 'admin_init', 'wps_src_dedupe_renewal_schedule' );
 
 /**
+ * Option prefix under which a pre-deactivation backup of the WooCommerce Stripe
+ * gateway settings is stored, so "Deactivate live keys" is fully reversible.
+ */
+define( 'WPS_SRC_STRIPE_BACKUP_PREFIX', 'wps_src_stripe_settings_backup_' );
+
+/**
+ * Whether this install looks like something other than production.
+ *
+ * Trusts an explicit wp_get_environment_type() first (local/development/staging
+ * are all non-production), then falls back to host heuristics: a development TLD
+ * (.local/.test/.dev/.localhost/.example/.invalid) or a staging/dev/test/qa/uat
+ * host label. A plain unrecognised host is treated as production so a real store
+ * is never nagged.
+ *
+ * @return bool
+ */
+if ( ! function_exists( 'wps_src_is_nonproduction_env' ) ) {
+	function wps_src_is_nonproduction_env() {
+		if ( function_exists( 'wp_get_environment_type' ) ) {
+			$type = wp_get_environment_type();
+			if ( in_array( $type, array( 'local', 'development', 'staging' ), true ) ) {
+				return true;
+			}
+			if ( 'production' === $type && ! defined( 'WP_ENVIRONMENT_TYPE' ) && ! getenv( 'WP_ENVIRONMENT_TYPE' ) ) {
+				// 'production' is also the default when nothing is set, so fall
+				// through to the host heuristics rather than trusting it blindly.
+				$type = '';
+			}
+			if ( 'production' === $type ) {
+				return false;
+			}
+		}
+
+		$host = '';
+		if ( function_exists( 'home_url' ) ) {
+			$host = (string) wp_parse_url( home_url(), PHP_URL_HOST );
+		}
+		$host = strtolower( $host );
+		if ( '' === $host ) {
+			return false;
+		}
+
+		foreach ( array( '.local', '.test', '.dev', '.localhost', '.example', '.invalid' ) as $tld ) {
+			if ( substr( $host, -strlen( $tld ) ) === $tld ) {
+				return true;
+			}
+		}
+		if ( 'localhost' === $host || '127.0.0.1' === $host ) {
+			return true;
+		}
+		if ( preg_match( '/(^|[.-])(staging|stg|dev|test|qa|uat|sandbox|local)([.-]|$)/', $host ) ) {
+			return true;
+		}
+
+		return false;
+	}
+}
+
+/**
+ * Whether a live Stripe key is present in the WooCommerce Stripe gateway
+ * settings, and whether it is currently armed (test mode off, so a charge would
+ * hit the live key).
+ *
+ * The base plugin's renewal charge class extends WC_Gateway_Stripe and reads its
+ * keys from this same option, so this one option governs the renewal charge path.
+ *
+ * @return array|false { armed:bool, enabled:bool, has_live:bool, fields:string[] }
+ *                     or false when no live key is present at all.
+ */
+if ( ! function_exists( 'wps_src_active_live_stripe' ) ) {
+	function wps_src_active_live_stripe() {
+		$settings = get_option( 'woocommerce_stripe_settings' );
+		if ( ! is_array( $settings ) ) {
+			return false;
+		}
+
+		$live_fields = array();
+		$candidates  = array(
+			'secret_key'      => '/^(sk|rk)_live_/',
+			'publishable_key' => '/^pk_live_/',
+		);
+		foreach ( $candidates as $field => $pattern ) {
+			$value = isset( $settings[ $field ] ) ? trim( (string) $settings[ $field ] ) : '';
+			if ( '' !== $value && preg_match( $pattern, $value ) ) {
+				$live_fields[] = $field;
+			}
+		}
+
+		if ( empty( $live_fields ) ) {
+			return false;
+		}
+
+		$testmode = ! isset( $settings['testmode'] ) || 'yes' === $settings['testmode'];
+
+		return array(
+			'armed'   => ! $testmode,
+			'enabled' => isset( $settings['enabled'] ) && 'yes' === $settings['enabled'],
+			'has_live' => true,
+			'fields'  => $live_fields,
+		);
+	}
+}
+
+/**
+ * Build the admin URL that triggers the reversible live-key deactivation.
+ *
+ * @return string
+ */
+if ( ! function_exists( 'wps_src_deactivate_live_keys_url' ) ) {
+	function wps_src_deactivate_live_keys_url() {
+		return wp_nonce_url(
+			admin_url( 'admin-post.php?action=wps_src_deactivate_live_keys' ),
+			'wps_src_deactivate_live_keys',
+			'wps_src_env_nonce'
+		);
+	}
+}
+
+/**
+ * Reversibly neutralise the live Stripe keys on a non-production install.
+ *
+ * Backs the whole gateway settings array up to a timestamped option first, then
+ * forces test mode on and blanks the live secret and publishable keys so the
+ * renewal charge path cannot reach Stripe live. The gateway's enabled flag and
+ * the renewal cron are intentionally left untouched: the named action is about
+ * the keys, and leaving the rest lets an admin restore from the backup and carry
+ * on. Nothing here is destructive.
+ *
+ * @return array { backup_key:string, blanked:string[] }
+ */
+if ( ! function_exists( 'wps_src_deactivate_live_keys' ) ) {
+	function wps_src_deactivate_live_keys() {
+		$settings = get_option( 'woocommerce_stripe_settings' );
+		if ( ! is_array( $settings ) ) {
+			return array( 'backup_key' => '', 'blanked' => array() );
+		}
+
+		$backup_key = WPS_SRC_STRIPE_BACKUP_PREFIX . gmdate( 'Ymd_His' );
+		add_option( $backup_key, $settings, '', 'no' );
+
+		$blanked = array();
+		foreach ( array( 'secret_key', 'publishable_key' ) as $field ) {
+			$value = isset( $settings[ $field ] ) ? trim( (string) $settings[ $field ] ) : '';
+			if ( '' !== $value && preg_match( '/^(sk|rk|pk)_live_/', $value ) ) {
+				$settings[ $field ] = '';
+				$blanked[]          = $field;
+			}
+		}
+		$settings['testmode'] = 'yes';
+
+		update_option( 'woocommerce_stripe_settings', $settings );
+
+		return array( 'backup_key' => $backup_key, 'blanked' => $blanked );
+	}
+}
+
+/**
+ * admin-post handler for the "Deactivate live keys" button.
+ */
+if ( ! function_exists( 'wps_src_handle_deactivate_live_keys' ) ) {
+	function wps_src_handle_deactivate_live_keys() {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			wp_die( esc_html__( 'You do not have permission to do this.', 'wps-subscriptions-extra' ) );
+		}
+		check_admin_referer( 'wps_src_deactivate_live_keys', 'wps_src_env_nonce' );
+
+		$result = wps_src_deactivate_live_keys();
+
+		$redirect = add_query_arg(
+			array(
+				'page'                  => 'subscriptions_for_woocommerce_extra',
+				'wps_src_env_done'      => 1,
+				'wps_src_env_backup'    => rawurlencode( $result['backup_key'] ),
+			),
+			admin_url( 'admin.php' )
+		);
+		wp_safe_redirect( $redirect );
+		exit;
+	}
+}
+add_action( 'admin_post_wps_src_deactivate_live_keys', 'wps_src_handle_deactivate_live_keys' );
+
+/**
+ * Site-wide admin notice: a live Stripe key on a non-production install is the
+ * exact condition that lets a staging or local clone charge real customer cards.
+ * Shown on every admin screen so it cannot be missed, with the one-click
+ * reversible deactivation.
+ */
+if ( ! function_exists( 'wps_src_environment_notice' ) ) {
+	function wps_src_environment_notice() {
+		if ( ! current_user_can( 'manage_woocommerce' ) ) {
+			return;
+		}
+		if ( ! wps_src_is_nonproduction_env() ) {
+			return;
+		}
+		$live = wps_src_active_live_stripe();
+		if ( false === $live ) {
+			return;
+		}
+
+		$class = $live['armed'] ? 'notice-error' : 'notice-warning';
+		echo '<div class="notice ' . esc_attr( $class ) . '"><p><strong>' . esc_html__( 'Environment check: live Stripe key on a non-production site', 'wps-subscriptions-extra' ) . '</strong></p>';
+
+		if ( $live['armed'] ) {
+			echo '<p>' . esc_html__( 'This install does not look like production, yet the WooCommerce Stripe gateway holds a live key with test mode OFF. Any renewal that runs here can charge a real customer card. This is how a staging or local clone double-charges customers.', 'wps-subscriptions-extra' ) . '</p>';
+		} else {
+			echo '<p>' . esc_html__( 'This install does not look like production, yet the WooCommerce Stripe gateway holds a live key. Test mode is currently on, but a single toggle would arm it against real cards.', 'wps-subscriptions-extra' ) . '</p>';
+		}
+
+		echo '<p><a href="' . esc_url( wps_src_deactivate_live_keys_url() ) . '" class="button button-primary" onclick="return confirm( \'' . esc_js( __( 'Back up and blank the live Stripe keys on this site, and force test mode on? A timestamped backup is saved so you can restore.', 'wps-subscriptions-extra' ) ) . '\' );">' . esc_html__( 'Deactivate live keys', 'wps-subscriptions-extra' ) . '</a></p></div>';
+	}
+}
+add_action( 'admin_notices', 'wps_src_environment_notice' );
+
+/**
  * Apply the recorded coupon discount(s) to a renewal order.
  *
  * Fired after the base plugin has built, totalled, and saved the renewal order.
@@ -1046,6 +1271,200 @@ if ( ! function_exists( 'wps_src_fix_pending_renewals' ) ) {
 }
 
 /**
+ * Whether a renewal order is eligible for a manual retry charge.
+ *
+ * A retry is only ever allowed on an order that is unmistakably unpaid, so it
+ * cannot double-charge one that already went through. All of these must hold:
+ * the order is a renewal, its payment method is Stripe (the only gateway whose
+ * off-session charge this can safely re-invoke; PayPal Standard captures the
+ * whole agreement out-of-band, so retrying it would double), its status is one
+ * of the not-yet-paid states, it carries no transaction id (so no prior capture
+ * succeeded behind a mislabelled status), its total is positive, and it was not
+ * zeroed by the duplicate-renewal guard.
+ *
+ * @param WC_Order $order Renewal order.
+ * @return true|WP_Error True when retryable, else a WP_Error explaining why not.
+ */
+if ( ! function_exists( 'wps_src_can_retry_renewal' ) ) {
+	function wps_src_can_retry_renewal( $order ) {
+		if ( ! ( $order instanceof WC_Order ) ) {
+			return new WP_Error( 'wps_src_no_order', __( 'Order not found.', 'wps-subscriptions-extra' ) );
+		}
+		if ( 'yes' !== $order->get_meta( WPS_SRC_RENEWAL_FLAG_META ) ) {
+			return new WP_Error( 'wps_src_not_renewal', __( 'Not a subscription renewal order.', 'wps-subscriptions-extra' ) );
+		}
+		if ( 'stripe' !== $order->get_payment_method() ) {
+			return new WP_Error( 'wps_src_not_stripe', __( 'Manual retry is only supported for Stripe renewals.', 'wps-subscriptions-extra' ) );
+		}
+		if ( ! in_array( $order->get_status(), array( 'pending', 'failed', 'on-hold' ), true ) ) {
+			return new WP_Error( 'wps_src_paid', __( 'This renewal is not in an unpaid state, so it will not be retried.', 'wps-subscriptions-extra' ) );
+		}
+		if ( '' !== (string) $order->get_transaction_id() ) {
+			return new WP_Error( 'wps_src_captured', __( 'This renewal already has a transaction id: a charge already succeeded, so it will not be retried.', 'wps-subscriptions-extra' ) );
+		}
+		if ( (float) $order->get_total() <= 0 ) {
+			return new WP_Error( 'wps_src_zero', __( 'This renewal has a zero total, so there is nothing to charge.', 'wps-subscriptions-extra' ) );
+		}
+		if ( 'yes' === $order->get_meta( WPS_SRC_DUP_META ) ) {
+			return new WP_Error( 'wps_src_dup', __( 'This renewal was suppressed as a duplicate, so it will not be charged.', 'wps-subscriptions-extra' ) );
+		}
+		return true;
+	}
+}
+
+/**
+ * Manually retry the Stripe charge for one failed renewal order, exactly once.
+ *
+ * The eligibility gate (wps_src_can_retry_renewal) guarantees the order is
+ * unpaid and un-captured. On top of that, an atomic in-flight lock is claimed by
+ * an INSERT against the UNIQUE option_name column: exactly one caller can hold
+ * it, so a double-clicked button (or any overlap with another charge attempt for
+ * the same order) cannot fire two charges. Eligibility is re-checked after the
+ * lock is held, against a freshly reloaded order, closing the read-then-charge
+ * window. The lock is released in a finally-style teardown so a genuinely failed
+ * attempt stays retryable; a successful one flips the order out of the unpaid
+ * states, so the eligibility gate refuses any further retry regardless.
+ *
+ * The charge itself is delegated to the base plugin by re-firing the same action
+ * its scheduler uses (wps_sfw_other_payment_gateway_renewal), so this stays
+ * correct across base-plugin updates and reuses the base gateway's own Stripe
+ * idempotency handling.
+ *
+ * @param int $order_id Renewal order ID.
+ * @return array|WP_Error { charged:bool, status:string } or a WP_Error.
+ */
+if ( ! function_exists( 'wps_src_retry_renewal' ) ) {
+	function wps_src_retry_renewal( $order_id ) {
+		$order_id = (int) $order_id;
+		$order    = wc_get_order( $order_id );
+
+		$eligible = wps_src_can_retry_renewal( $order );
+		if ( is_wp_error( $eligible ) ) {
+			return $eligible;
+		}
+
+		$lock_key = 'wps_src_retry_' . $order_id;
+		$now      = time();
+		$stale    = 5 * MINUTE_IN_SECONDS;
+
+		// Atomic claim. add_option() returns false when the row already exists.
+		if ( ! add_option( $lock_key, (string) $now, '', 'no' ) ) {
+			$held = (int) get_option( $lock_key, 0 );
+			if ( $held && ( $now - $held ) < $stale ) {
+				return new WP_Error( 'wps_src_inflight', __( 'A charge attempt for this renewal is already in progress. Try again in a moment.', 'wps-subscriptions-extra' ) );
+			}
+			// Stale lock from an attempt that died mid-run: take it over atomically.
+			global $wpdb;
+			$rows = $wpdb->query(
+				$wpdb->prepare(
+					"UPDATE {$wpdb->options} SET option_value = %s WHERE option_name = %s AND CAST( option_value AS UNSIGNED ) <= %d",
+					(string) $now,
+					$lock_key,
+					$now - $stale
+				)
+			);
+			if ( $rows < 1 ) {
+				return new WP_Error( 'wps_src_inflight', __( 'A charge attempt for this renewal is already in progress. Try again in a moment.', 'wps-subscriptions-extra' ) );
+			}
+		}
+
+		// Re-check eligibility under the lock against a fresh order read.
+		$order    = wc_get_order( $order_id );
+		$eligible = wps_src_can_retry_renewal( $order );
+		if ( is_wp_error( $eligible ) ) {
+			delete_option( $lock_key );
+			return $eligible;
+		}
+
+		$subscription_id = (int) $order->get_meta( WPS_SRC_SUBSCRIPTION_REF_META );
+
+		// Delegate the charge to the base plugin's own Stripe renewal path.
+		do_action( 'wps_sfw_other_payment_gateway_renewal', $order, $subscription_id, 'stripe' );
+
+		delete_option( $lock_key );
+
+		$after   = wc_get_order( $order_id );
+		$status  = $after ? $after->get_status() : 'unknown';
+		$charged = $after && ( in_array( $status, array( 'processing', 'completed' ), true ) || '' !== (string) $after->get_transaction_id() );
+
+		if ( $charged ) {
+			$order->add_order_note( __( 'Renewal charge retried manually via Subscriptions for WooCommerce Extra: charge succeeded.', 'wps-subscriptions-extra' ) );
+		}
+
+		return array( 'charged' => (bool) $charged, 'status' => $status );
+	}
+}
+
+/**
+ * List recent renewal orders that are unpaid and Stripe-based, for the manual
+ * retry section on the admin page.
+ *
+ * @param int $limit Maximum orders to return.
+ * @return int[] Order IDs, newest first.
+ */
+if ( ! function_exists( 'wps_src_failed_renewal_ids' ) ) {
+	function wps_src_failed_renewal_ids( $limit = 25 ) {
+		if ( ! function_exists( 'wc_get_orders' ) ) {
+			return array();
+		}
+		return (array) wc_get_orders(
+			array(
+				'type'       => 'shop_order',
+				'status'     => array( 'failed', 'pending', 'on-hold' ),
+				'limit'      => (int) $limit,
+				'orderby'    => 'date',
+				'order'      => 'DESC',
+				'return'     => 'ids',
+				'meta_key'   => WPS_SRC_RENEWAL_FLAG_META,
+				'meta_value' => 'yes',
+			)
+		);
+	}
+}
+
+/**
+ * Substrings the base plugin's Stripe and Stripe SEPA gateways write into an
+ * order note when an off-session renewal charge attempt reaches Stripe and is
+ * declined or otherwise rejected (subscriptions-for-woocommerce
+ * package/gateways/stripe(-sepa)/class-wps-subscriptions-payment-stripe*.php).
+ * A renewal order carrying none of these notes never reached the gateway at
+ * all: the order sitting unpaid is not itself proof a card was ever tried.
+ *
+ * @return string[]
+ */
+if ( ! function_exists( 'wps_src_decline_note_markers' ) ) {
+	function wps_src_decline_note_markers() {
+		return array( 'unable to process your payment', 'requires authentication', 'charge awaiting authentication' );
+	}
+}
+
+/**
+ * Whether a renewal order shows evidence of an actual charge attempt, versus
+ * having simply never been tried yet (e.g. its cron pass has not run, or it
+ * failed before reaching the gateway call).
+ *
+ * @param WC_Order $order Renewal order.
+ * @return string 'declined' when an order note matches a known gateway
+ *                failure message, else 'no_attempt'.
+ */
+if ( ! function_exists( 'wps_src_renewal_attempt_status' ) ) {
+	function wps_src_renewal_attempt_status( $order ) {
+		if ( ! ( $order instanceof WC_Order ) ) {
+			return 'no_attempt';
+		}
+		foreach ( wc_get_order_notes( array( 'order_id' => $order->get_id() ) ) as $note ) {
+			$content = strtolower( wp_strip_all_tags( $note->content ) );
+			foreach ( wps_src_decline_note_markers() as $marker ) {
+				if ( false !== strpos( $content, $marker ) ) {
+					return 'declined';
+				}
+			}
+		}
+		return 'no_attempt';
+	}
+}
+
+/**
  * Compute a subscription's next-renewal price before and after the snapshot
  * discount, without creating an order. Single-line estimate.
  *
@@ -1258,7 +1677,7 @@ if ( ! function_exists( 'wps_src_register_admin_page' ) ) {
 		add_submenu_page(
 			'woocommerce',
 			__( 'Subscriptions for WooCommerce Extra', 'wps-subscriptions-extra' ),
-			__( 'Wps Subscriptions Extra', 'wps-subscriptions-extra' ),
+			__( 'WPS Subscriptions Extra', 'wps-subscriptions-extra' ),
 			'manage_woocommerce',
 			'subscriptions_for_woocommerce_extra',
 			'wps_src_render_admin_page'
@@ -1266,6 +1685,25 @@ if ( ! function_exists( 'wps_src_register_admin_page' ) ) {
 	}
 }
 add_action( 'admin_menu', 'wps_src_register_admin_page', 99 );
+
+/**
+ * Hide the base plugin's separate top-level "WP Swings" menu (add_menu_page
+ * slug 'wps-plugins'), when the admin has opted in. The base plugin already
+ * registers its actual settings as a submenu under WooCommerce -> Wps
+ * Subscriptions, so the top-level entry is a duplicate link to the same
+ * plugin, not a distinct feature. Runs late on admin_menu so the base
+ * plugin's own (priority-unspecified) registration has already happened;
+ * remove_menu_page() only hides the menu item, it does not deactivate
+ * anything the base plugin does.
+ */
+if ( ! function_exists( 'wps_src_maybe_hide_wpswings_menu' ) ) {
+	function wps_src_maybe_hide_wpswings_menu() {
+		if ( 'yes' === get_option( WPS_SRC_HIDE_WPSWINGS_MENU_OPTION ) ) {
+			remove_menu_page( 'wps-plugins' );
+		}
+	}
+}
+add_action( 'admin_menu', 'wps_src_maybe_hide_wpswings_menu', 999 );
 
 /**
  * Render a backfill/fix result block: a summary notice plus a capped log.
@@ -1440,6 +1878,13 @@ if ( ! function_exists( 'wps_src_render_admin_page' ) ) {
 			$notices[] = array( 'success', __( 'Discount mode saved.', 'wps-subscriptions-extra' ) );
 		}
 
+		// Save menu-cleanup preference.
+		if ( isset( $_POST['wps_src_savemenu'] ) ) {
+			check_admin_referer( 'wps_src_savemenu', 'wps_src_savemenu_nonce' );
+			update_option( WPS_SRC_HIDE_WPSWINGS_MENU_OPTION, isset( $_POST['wps_src_hide_wpswings_menu'] ) ? 'yes' : 'no' );
+			$notices[] = array( 'success', __( 'Menu preference saved. Reload wp-admin to see the change.', 'wps-subscriptions-extra' ) );
+		}
+
 		// Backfill.
 		if ( isset( $_POST['wps_src_backfill'] ) ) {
 			check_admin_referer( 'wps_src_backfill', 'wps_src_backfill_nonce' );
@@ -1512,6 +1957,32 @@ if ( ! function_exists( 'wps_src_render_admin_page' ) ) {
 			}
 		}
 
+		// Manual retry of a failed renewal charge.
+		if ( isset( $_POST['wps_src_retry'] ) ) {
+			check_admin_referer( 'wps_src_retry', 'wps_src_retry_nonce' );
+			$retry_id = isset( $_POST['wps_src_retry_id'] ) ? absint( $_POST['wps_src_retry_id'] ) : 0;
+			if ( $retry_id ) {
+				$retry = wps_src_retry_renewal( $retry_id );
+				if ( is_wp_error( $retry ) ) {
+					/* translators: 1: order ID, 2: reason */
+					$notices[] = array( 'warning', sprintf( __( 'Renewal #%1$d not retried: %2$s', 'wps-subscriptions-extra' ), $retry_id, $retry->get_error_message() ) );
+				} elseif ( ! empty( $retry['charged'] ) ) {
+					/* translators: %d: order ID */
+					$notices[] = array( 'success', sprintf( __( 'Renewal #%d charged successfully.', 'wps-subscriptions-extra' ), $retry_id ) );
+				} else {
+					/* translators: 1: order ID, 2: resulting status */
+					$notices[] = array( 'warning', sprintf( __( 'Renewal #%1$d retry ran but did not succeed (status: %2$s). No duplicate charge was made; the card was declined or the gateway rejected it.', 'wps-subscriptions-extra' ), $retry_id, esc_html( $retry['status'] ) ) );
+				}
+			}
+		}
+
+		// Confirmation after the live-key deactivation redirect.
+		if ( isset( $_GET['wps_src_env_done'] ) ) {
+			$backup = isset( $_GET['wps_src_env_backup'] ) ? sanitize_text_field( wp_unslash( $_GET['wps_src_env_backup'] ) ) : '';
+			/* translators: %s: backup option name */
+			$notices[] = array( 'success', sprintf( __( 'Live Stripe keys blanked and test mode forced on. Original settings backed up to option "%s"; restore from there if this was the wrong site.', 'wps-subscriptions-extra' ), $backup ) );
+		}
+
 		$stats        = wps_src_get_stats();
 		$current_mode = ( 'live' === get_option( WPS_SRC_MODE_OPTION, 'lock' ) ) ? 'live' : 'lock';
 		$last_run     = get_option( WPS_SRC_LASTRUN_OPTION, array() );
@@ -1568,6 +2039,33 @@ if ( ! function_exists( 'wps_src_render_admin_page' ) ) {
 			) . '</p></div>';
 		}
 
+		// Environment check.
+		echo '<h2>' . esc_html__( 'Environment check', 'wps-subscriptions-extra' ) . '</h2>';
+		$nonprod = wps_src_is_nonproduction_env();
+		$live    = wps_src_active_live_stripe();
+		if ( $nonprod && false !== $live ) {
+			$msg = $live['armed']
+				? esc_html__( 'This install does not look like production and holds a live Stripe key with test mode OFF. Renewals here can charge real cards.', 'wps-subscriptions-extra' )
+				: esc_html__( 'This install does not look like production and holds a live Stripe key. Test mode is on for now, but one toggle would arm it.', 'wps-subscriptions-extra' );
+			echo '<div class="notice ' . ( $live['armed'] ? 'notice-error' : 'notice-warning' ) . ' inline"><p>' . $msg . '</p>';
+			echo '<p><a href="' . esc_url( wps_src_deactivate_live_keys_url() ) . '" class="button button-primary" onclick="return confirm( \'' . esc_js( __( 'Back up and blank the live Stripe keys on this site, and force test mode on?', 'wps-subscriptions-extra' ) ) . '\' );">' . esc_html__( 'Deactivate live keys', 'wps-subscriptions-extra' ) . '</a></p></div>';
+		} elseif ( $nonprod ) {
+			echo '<p>' . esc_html__( 'Non-production install, no live Stripe key active. Safe.', 'wps-subscriptions-extra' ) . '</p>';
+		} else {
+			echo '<p>' . esc_html__( 'This install looks like production. No environment warning.', 'wps-subscriptions-extra' ) . '</p>';
+		}
+		echo '<p class="description">' . esc_html__( 'A live Stripe key on a staging or local clone is what lets it charge real customer cards behind production\'s back. Deactivating is reversible: the full gateway settings are backed up to a timestamped option first.', 'wps-subscriptions-extra' ) . '</p>';
+
+		// Menu cleanup.
+		echo '<h2>' . esc_html__( 'Menu cleanup', 'wps-subscriptions-extra' ) . '</h2>';
+		echo '<form method="post">';
+		wp_nonce_field( 'wps_src_savemenu', 'wps_src_savemenu_nonce' );
+		$hide_wpswings_menu = ( 'yes' === get_option( WPS_SRC_HIDE_WPSWINGS_MENU_OPTION ) );
+		echo '<p><label><input type="checkbox" name="wps_src_hide_wpswings_menu" value="1" ' . checked( $hide_wpswings_menu, true, false ) . ' /> ' . esc_html__( 'Hide the "WP Swings" top-level admin menu item', 'wps-subscriptions-extra' ) . '</label></p>';
+		echo '<p class="description">' . esc_html__( 'Subscriptions for WooCommerce already registers its settings under WooCommerce -> Wps Subscriptions. The separate top-level "WP Swings" menu links to the same plugin, so it is a duplicate entry point. Hiding it only removes the menu item; nothing about the plugin itself is disabled.', 'wps-subscriptions-extra' ) . '</p>';
+		echo '<p><button type="submit" name="wps_src_savemenu" value="1" class="button">' . esc_html__( 'Save', 'wps-subscriptions-extra' ) . '</button></p>';
+		echo '</form>';
+
 		// Discount mode.
 		echo '<h2>' . esc_html__( 'Discount mode', 'wps-subscriptions-extra' ) . '</h2>';
 		echo '<form method="post">';
@@ -1612,6 +2110,54 @@ if ( ! function_exists( 'wps_src_render_admin_page' ) ) {
 		echo '<p><button type="submit" name="wps_src_fixrenewals" value="1" class="button button-primary">' . esc_html__( 'Fix Pending Renewals', 'wps-subscriptions-extra' ) . '</button></p>';
 		echo '</form>';
 		wps_src_render_result( $fix_result );
+
+		// Retry failed renewal charges.
+		echo '<h2>' . esc_html__( 'Retry failed renewal charges', 'wps-subscriptions-extra' ) . '</h2>';
+		echo '<p>' . esc_html__( 'Manually re-charge a Stripe renewal that failed. A retry runs only when the order is provably unpaid (unpaid status, no transaction id, positive total) and holds an atomic in-flight lock, so it cannot double-charge one that already went through.', 'wps-subscriptions-extra' ) . '</p>';
+		echo '<p class="description">' . esc_html__( 'This list includes both renewals that were actually attempted and declined by the gateway, and renewals still sitting unpaid before any charge attempt was made (their status is "pending" either way; WooCommerce does not have a distinct status for "not yet tried"). The Payment attempt column tells the two apart.', 'wps-subscriptions-extra' ) . '</p>';
+		$failed_ids = wps_src_failed_renewal_ids( 25 );
+		if ( empty( $failed_ids ) ) {
+			echo '<p>' . esc_html__( 'No unpaid Stripe renewal orders found.', 'wps-subscriptions-extra' ) . '</p>';
+		} else {
+			echo '<table class="widefat striped"><thead><tr>';
+			echo '<th>' . esc_html__( 'Order', 'wps-subscriptions-extra' ) . '</th>';
+			echo '<th>' . esc_html__( 'Date', 'wps-subscriptions-extra' ) . '</th>';
+			echo '<th>' . esc_html__( 'Status', 'wps-subscriptions-extra' ) . '</th>';
+			echo '<th>' . esc_html__( 'Payment attempt', 'wps-subscriptions-extra' ) . '</th>';
+			echo '<th>' . esc_html__( 'Total', 'wps-subscriptions-extra' ) . '</th>';
+			echo '<th>' . esc_html__( 'Can be retried', 'wps-subscriptions-extra' ) . '</th>';
+			echo '<th>' . esc_html__( 'Action', 'wps-subscriptions-extra' ) . '</th>';
+			echo '</tr></thead><tbody>';
+			foreach ( $failed_ids as $rid ) {
+				$rorder = wc_get_order( $rid );
+				if ( ! $rorder ) {
+					continue;
+				}
+				$can      = wps_src_can_retry_renewal( $rorder );
+				$date     = $rorder->get_date_created() ? wp_date( 'Y-m-d H:i', $rorder->get_date_created()->getTimestamp() ) : '-';
+				$edit_url = wps_src_order_edit_url( $rid );
+				$attempt  = wps_src_renewal_attempt_status( $rorder );
+				echo '<tr>';
+				echo '<td><a href="' . esc_url( $edit_url ) . '">#' . (int) $rid . '</a></td>';
+				echo '<td>' . esc_html( $date ) . '</td>';
+				echo '<td>' . esc_html( $rorder->get_status() ) . '</td>';
+				echo '<td>' . ( 'declined' === $attempt ? esc_html__( 'Declined by gateway', 'wps-subscriptions-extra' ) : esc_html__( 'Never charged yet', 'wps-subscriptions-extra' ) ) . '</td>';
+				echo '<td>' . wp_kses_post( wc_price( $rorder->get_total() ) ) . '</td>';
+				if ( is_wp_error( $can ) ) {
+					echo '<td>' . esc_html__( 'No', 'wps-subscriptions-extra' ) . '</td>';
+					echo '<td><span class="description">' . esc_html( $can->get_error_message() ) . '</span></td>';
+				} else {
+					echo '<td>' . esc_html__( 'Yes', 'wps-subscriptions-extra' ) . '</td>';
+					echo '<td><form method="post" style="margin:0;">';
+					wp_nonce_field( 'wps_src_retry', 'wps_src_retry_nonce' );
+					echo '<input type="hidden" name="wps_src_retry_id" value="' . (int) $rid . '" />';
+					echo '<button type="submit" name="wps_src_retry" value="1" class="button button-small" onclick="return confirm( \'' . esc_js( sprintf( /* translators: %d: order ID */ __( 'Retry the Stripe charge for renewal #%d now?', 'wps-subscriptions-extra' ), $rid ) ) . '\' );">' . esc_html__( 'Retry this renewal', 'wps-subscriptions-extra' ) . '</button>';
+					echo '</form></td>';
+				}
+				echo '</tr>';
+			}
+			echo '</tbody></table>';
+		}
 
 		// Preview next renewal.
 		echo '<h2>' . esc_html__( 'Preview next renewal', 'wps-subscriptions-extra' ) . '</h2>';
@@ -1704,11 +2250,15 @@ if ( ! function_exists( 'wps_src_uninstall' ) ) {
 		// Plugin options and cached stats.
 		delete_option( WPS_SRC_MODE_OPTION );
 		delete_option( WPS_SRC_LASTRUN_OPTION );
+		delete_option( WPS_SRC_HIDE_WPSWINGS_MENU_OPTION );
 		delete_transient( WPS_SRC_STATS_TRANSIENT );
 
-		// Per-period duplicate-renewal claim rows written by the guard.
+		// Per-period duplicate-renewal claim rows and manual-retry in-flight locks.
+		// Stripe settings backups (wps_src_stripe_settings_backup_*) are left in
+		// place on purpose: they may hold the only copy of blanked live keys.
 		global $wpdb;
 		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE 'wps_src_renclaim\\_%'" );
+		$wpdb->query( "DELETE FROM {$wpdb->options} WHERE option_name LIKE 'wps_src_retry\\_%'" );
 
 		// Legacy CPT-stored subscriptions.
 		delete_post_meta_by_key( WPS_SRC_SNAPSHOT_META );
